@@ -1,23 +1,53 @@
 #!/usr/bin/env osascript -l JavaScript
+
 ObjC.import("stdlib");
+
 const app = Application.currentApplication();
 app.includeStandardAdditions = true;
+
 //──────────────────────────────────────────────────────────────────────────────
 
 /** @param {string} str */
 function alfredMatcher(str) {
-	const clean = str.replace(/[-_#()[\].:;,'"`]/g, " ");
-	return [clean, str].join(" ") + " ";
+  const clean = str.replace(/[-_#()[\].:;,'"`]/g, " ");
+  return [clean, str].join(" ") + " ";
 }
 
-/** @return {string} path of front Finder window; `""` if there is no Finder window */
+/** @param {string} s */
+function shQuote(s) {
+  // Safe single-quote escaping for shell
+  return "'" + s.replace(/'/g, "'\\''") + "'";
+}
+
+/** @param {string} appleScript */
+function runAppleScript(appleScript) {
+  try {
+    return app
+      .doShellScript("/usr/bin/osascript -e " + shQuote(appleScript))
+      .trim();
+  } catch (_error) {
+    return "";
+  }
+}
+
+/** @return {string} path of front Finder/Path Finder window; `""` if none */
 function getFrontWin() {
-	try {
-		const path = Application("Finder").insertionLocation().url().slice(7, -1);
-		return decodeURIComponent(path);
-	} catch (_error) {
-		return "";
-	}
+  // 1) Try Path Finder (if installed + has a window)
+  const pathFinderPath = runAppleScript(`
+    tell application "Path Finder"
+      if (count of finder windows) is 0 then return ""
+      return POSIX path of (target of front finder window)
+    end tell
+  `);
+  if (pathFinderPath) return pathFinderPath;
+
+  // 2) Fallback to Finder (original behavior)
+  try {
+    const path = Application("Finder").insertionLocation().url().slice(7, -1);
+    return decodeURIComponent(path);
+  } catch (_error) {
+    return "";
+  }
 }
 
 /** Necessary, as this workflow requires unique keywords to determine which kind
@@ -25,52 +55,55 @@ function getFrontWin() {
  * @return {boolean} whether there are duplicates
  */
 function hasDuplicateKeywords() {
-	const keywords = [
-		$.getenv("custom_folder_keyword"),
-		$.getenv("recent_keyword"),
-		$.getenv("frontwin_keyword"),
-		$.getenv("tag_keyword"),
-		$.getenv("trash_keyword"),
-	];
-	const uniqueKeywords = [...new Set(keywords)];
-	return uniqueKeywords.length !== keywords.length;
+  const keywords = [
+    $.getenv("custom_folder_keyword"),
+    $.getenv("recent_keyword"),
+    $.getenv("frontwin_keyword"),
+    $.getenv("tag_keyword"),
+    $.getenv("trash_keyword"),
+  ];
+  const uniqueKeywords = [...new Set(keywords)];
+  return uniqueKeywords.length !== keywords.length;
 }
 
 /** @param {string} msg */
 function errorItem(msg) {
-	return JSON.stringify({ items: [{ title: msg, valid: false }] });
+  return JSON.stringify({ items: [{ title: msg, valid: false }] });
 }
 
 /** @return {string} path */
 function getTrashPathQuoted() {
-	const macosVersion = Number.parseFloat(app.systemInfo().systemVersion);
-	let trashLocation = "$HOME/Library/Mobile Documents/";
+  const macosVersion = Number.parseFloat(app.systemInfo().systemVersion);
+  let trashLocation = "$HOME/Library/Mobile Documents/";
 
-	// location dependent on macOS version: https://github.com/chrisgrieser/alfred-quick-file-access/issues/4
-	if (macosVersion < 15) trashLocation += "com~apple~CloudDocs/";
-	const trashPath = trashLocation + ".Trash";
+  // location dependent on macOS version:
+  // https://github.com/chrisgrieser/alfred-quick-file-access/issues/4
+  if (macosVersion < 15) trashLocation += "com~apple~CloudDocs/";
 
-	// Checking via `Application("Finder").exists()` sometimes has permission
-	// issues because the path is in iCloud. Thus checking via `test -d` instead.
-	const userHasIcloudDrive = app.doShellScript(`test -d "${trashPath}" || echo "no"`) !== "no";
+  const trashPath = trashLocation + ".Trash";
 
-	if (userHasIcloudDrive) return `"${trashPath}"`;
+  // Checking via `Application("Finder").exists()` sometimes has permission
+  // issues because the path is in iCloud. Thus checking via `test -d` instead.
+  const userHasIcloudDrive =
+    app.doShellScript(`test -d "${trashPath}" || echo "no"`) !== "no";
 
-	return "";
+  if (userHasIcloudDrive) return `"${trashPath}"`;
+  return "";
 }
 
 //──────────────────────────────────────────────────────────────────────────────
 
 const rgIgnoreFile =
-	$.getenv("alfred_preferences") +
-	"/workflows/" +
-	$.getenv("alfred_workflow_uid") +
-	"/scripts/home-icloud-ignore-file";
+  $.getenv("alfred_preferences") +
+  "/workflows/" +
+  $.getenv("alfred_workflow_uid") +
+  "/scripts/home-icloud-ignore-file";
 
 // FIX for external CLIs not being recognized on older Macs
 const pathExport = "export PATH=/usr/local/lib:/usr/local/bin:/opt/homebrew/bin/:$PATH ; ";
 
-/** @typedef {Object} SearchConfig
+/**
+ * @typedef {Object} SearchConfig
  * @property {string} shellCmd `%s` is replaced with `directory`
  * @property {boolean=} shallowOutput whether the `shellCmd` performs a search of depth 1
  * @property {boolean=} absPathOutput whether the `shellCmd` gives absolute paths as output
@@ -79,118 +112,139 @@ const pathExport = "export PATH=/usr/local/lib:/usr/local/bin:/opt/homebrew/bin/
 
 /** @type {Record<string, SearchConfig>} */
 const searchConfig = {
-	[$.getenv("recent_keyword")]: {
-		// INFO `fd` does not allow to sort results by recency, thus using `rg` instead
-		// CAVEAT As opposed to `fd`, `rg` does not give us folders, which is
-		// acceptable since this searches for recent files, and modification dates
-		// for folders are unintuitive anyway (only affected by files one level deep).
-		shellCmd:
-			pathExport +
-			`cd "%s" && rg --no-config --files --binary --sortr=modified --ignore-file="${rgIgnoreFile}"`,
-		directory: app.pathTo("home folder"),
-	},
-	[$.getenv("custom_folder_keyword")]: {
-		shellCmd: `ls -t "%s"`, // `-t` to sort by modification date
-		directory: $.getenv("custom_folder"),
-		shallowOutput: true,
-	},
-	[$.getenv("trash_keyword")]: {
-		// - `-maxdepth 1 -mindepth 1` is faster than `-depth 1` PERF
-		// - not using `rg`, since it does not find folders
-		shellCmd: `find "$HOME/.Trash" ${getTrashPathQuoted()} -maxdepth 1 -mindepth 1`,
-		absPathOutput: true,
-		shallowOutput: true,
-	},
-	[$.getenv("tag_keyword")]: {
-		// - `stat`/`sort` to sort by modification date
-		// - exclude trash, since due to some bug it's sometimes included
-		shellCmd:
-			`mdfind "kMDItemUserTags == ${$.getenv("tag_to_search")}" ` +
-			'| grep --invert-match "/.Trash/" | xargs -I {} stat -f "%m %N" "{}" | sort -nr | cut -d" " -f2-',
-		absPathOutput: true,
-	},
-	[$.getenv("frontwin_keyword")]: {
-		shellCmd: `ls -t "%s"`, // `-t` to sort by modification date
-		directory: "%s", // inserted on runtime
-		shallowOutput: true,
-	},
+  [$.getenv("recent_keyword")]: {
+    // INFO `fd` does not allow to sort results by recency, thus using `rg` instead
+    // CAVEAT As opposed to `fd`, `rg` does not give us folders, which is
+    // acceptable since this searches for recent files, and modification dates
+    // for folders are unintuitive anyway (only affected by files one level deep).
+    shellCmd:
+      pathExport +
+      `cd "%s" && rg --no-config --files --binary --sortr=modified --ignore-file="${rgIgnoreFile}"`,
+    directory: app.pathTo("home folder"),
+  },
+
+  [$.getenv("custom_folder_keyword")]: {
+    shellCmd: `ls -t "%s"`, // `-t` to sort by modification date
+    directory: $.getenv("custom_folder"),
+    shallowOutput: true,
+  },
+
+  [$.getenv("trash_keyword")]: {
+    // - `-maxdepth 1 -mindepth 1` is faster than `-depth 1` PERF
+    // - not using `rg`, since it does not find folders
+    shellCmd: `find "$HOME/.Trash" ${getTrashPathQuoted()} -maxdepth 1 -mindepth 1`,
+    absPathOutput: true,
+    shallowOutput: true,
+  },
+
+  [$.getenv("tag_keyword")]: {
+    // - `stat`/`sort` to sort by modification date
+    // - exclude trash, since due to some bug it's sometimes included
+    shellCmd:
+      `mdfind "kMDItemUserTags == ${$.getenv("tag_to_search")}" ` +
+      '| grep --invert-match "/.Trash/" | xargs -I {} stat -f "%m %N" "{}" | sort -nr | cut -d" " -f2-',
+    absPathOutput: true,
+  },
+
+  [$.getenv("frontwin_keyword")]: {
+    shellCmd: `ls -t "%s"`, // `-t` to sort by modification date
+    directory: "%s", // inserted on runtime
+    shallowOutput: true,
+  },
 };
 
 //──────────────────────────────────────────────────────────────────────────────
 
 /** @type {AlfredRun} */
-// biome-ignore lint/correctness/noUnusedVariables: Alfred run
+// biome-ignore lint/correctness/noUnusedVariables: Alfred run function
+run();
+
 function run() {
-	// DETERMINE KEYWORD
-	if (hasDuplicateKeywords()) return errorItem("⚠️ Duplicate keywords in workflow configuration.");
-	const keyword = // `alfred_workflow_keyword` is not set when triggered via hotkey
-		$.NSProcessInfo.processInfo.environment.objectForKey("alfred_workflow_keyword").js ||
-		$.NSProcessInfo.processInfo.environment.objectForKey("keyword_from_hotkey").js;
-	console.log("KEYWORD:", keyword);
+  // DETERMINE KEYWORD
+  if (hasDuplicateKeywords())
+    return errorItem("⚠️ Duplicate keywords in workflow configuration.");
 
-	// PARAMETERS
-	let { shellCmd, directory, absPathOutput, shallowOutput } = searchConfig[keyword];
-	const maxFiles =
-		keyword === $.getenv("recent_keyword")
-			? Math.max(Number.parseInt($.getenv("max_recent_files")), 9)
-			: undefined;
-	if (keyword === $.getenv("frontwin_keyword")) {
-		directory = getFrontWin();
-		if (directory === "") return errorItem("⚠️ No Finder window found.");
-	}
-	if (directory) shellCmd = shellCmd.replace("%s", directory);
+  const keyword =
+    // `alfred_workflow_keyword` is not set when triggered via hotkey
+    $.NSProcessInfo.processInfo.environment.objectForKey("alfred_workflow_keyword").js ||
+    $.NSProcessInfo.processInfo.environment.objectForKey("keyword_from_hotkey").js;
 
-	// EXECUTE SEARCH
-	console.log("SHELL COMMAND\n" + shellCmd);
-	const stdout = app.doShellScript(shellCmd).trim();
-	console.log("\nSTDOUT (shortened)\n" + stdout.slice(0, 300));
-	if (stdout === "") return errorItem("No files found.");
+  console.log("KEYWORD:", keyword);
 
-	// CREATE ALFRED ITEMS
-	const results = stdout
-		.split("\r")
-		.slice(0, maxFiles)
-		.map((line) => {
-			const parts = line.split("/");
-			const name = parts.pop() || "";
-			const absPath = absPathOutput ? line : directory + "/" + line;
+  // PARAMETERS
+  let { shellCmd, directory, absPathOutput, shallowOutput } = searchConfig[keyword];
 
-			let subtitle = "";
-			if (!shallowOutput) {
-				const parent = parts.join("/");
-				subtitle = parent.replace(/.*\/com~apple~CloudDocs/, "☁").replace(/\/Users\/\w+/, "~");
-				subtitle = "▸ " + subtitle;
-			}
+  const maxFiles =
+    keyword === $.getenv("recent_keyword")
+      ? Math.max(Number.parseInt($.getenv("max_recent_files")), 9)
+      : undefined;
 
-			const ext = name.split(".").pop() || "";
-			const imageExt = ["png", "jpg", "jpeg", "gif", "icns", "tiff", "heic"];
-			/** @type {AlfredIcon} */
-			const icon = imageExt.includes(ext)
-				? { path: absPath }
-				: { path: absPath, type: "fileicon" };
+  if (keyword === $.getenv("frontwin_keyword")) {
+    directory = getFrontWin();
+    if (directory === "") return errorItem("⚠️ No Finder or Path Finder window found.");
+  }
 
-			/** @type {AlfredItem} */
-			const item = {
-				title: name,
-				subtitle: subtitle,
-				arg: absPath,
-				quicklookurl: absPath,
-				type: "file:skipcheck",
-				match: alfredMatcher(name),
-				icon: icon,
-			};
-			if (keyword === $.getenv("frontwin_keyword")) {
-				item.mods = {
-					cmd: { subtitle: "⛔ Already front window", valid: false },
-				};
-			} else if (keyword === $.getenv("tag_keyword")) {
-				item.title = $.getenv("tag_prefix") + " " + item.title;
-			}
-			return item;
-		});
+  if (directory) shellCmd = shellCmd.replace("%s", directory);
 
-	// INFO do not use Alfred's caching mechanism, since it does not work with
-	// the `alfred_workflow_keyword` environment variable https://www.alfredforum.com/topic/21754-wrong-alfred-55-cache-used-when-using-alternate-keywords-like-foobar/#comment-113358
-	// (Also, it would interfere with the results needing to be live.)
-	return JSON.stringify({ items: results });
+  // EXECUTE SEARCH
+  console.log("SHELL COMMAND\n" + shellCmd);
+
+  const stdout = app.doShellScript(shellCmd).trim();
+  console.log("\nSTDOUT (shortened)\n" + stdout.slice(0, 300));
+
+  if (stdout === "") return errorItem("No files found.");
+
+  // CREATE ALFRED ITEMS
+  const results = stdout
+    .split("\r")
+    .slice(0, maxFiles)
+    .map((line) => {
+      const parts = line.split("/");
+      const name = parts.pop() || "";
+      const absPath = absPathOutput ? line : directory + "/" + line;
+
+      let subtitle = "";
+      if (!shallowOutput) {
+        const parent = parts.join("/");
+        subtitle = parent
+          .replace(/.*\/com~apple~CloudDocs/, "☁")
+          .replace(/\/Users\/\w+/, "~");
+        subtitle = "▸ " + subtitle;
+      }
+
+      const ext = name.split(".").pop() || "";
+      const imageExt = ["png", "jpg", "jpeg", "gif", "icns", "tiff", "heic"];
+
+      /** @type {AlfredIcon} */
+      const icon = imageExt.includes(ext)
+        ? { path: absPath }
+        : { path: absPath, type: "fileicon" };
+
+      /** @type {AlfredItem} */
+      const item = {
+        title: name,
+        subtitle: subtitle,
+        arg: absPath,
+        quicklookurl: absPath,
+        type: "file:skipcheck",
+        match: alfredMatcher(name),
+        icon: icon,
+      };
+
+      if (keyword === $.getenv("frontwin_keyword")) {
+        item.mods = {
+          cmd: { subtitle: "⛔ Already front window", valid: false },
+        };
+      } else if (keyword === $.getenv("tag_keyword")) {
+        item.title = $.getenv("tag_prefix") + " " + item.title;
+      }
+
+      return item;
+    });
+
+  // INFO do not use Alfred's caching mechanism, since it does not work with
+  // the `alfred_workflow_keyword` environment variable
+  // https://www.alfredforum.com/topic/21754-wrong-alfred-55-cache-used-when-using-alternate-keywords-like-foobar/#comment-113358
+  // (Also, it would interfere with the results needing to be live.)
+  return JSON.stringify({ items: results });
 }
